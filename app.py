@@ -1,4 +1,9 @@
 from html import escape
+import hashlib
+import io
+
+from PIL import Image
+from image_table import extract_table
 
 import pandas as pd
 import streamlit as st
@@ -36,14 +41,14 @@ with st.sidebar:
     st.caption("让数据清晰，让决策简单")
     st.divider()
     st.subheader("数据源")
-    uploaded_file = st.file_uploader("上传数据文件", type=["csv", "xlsx"],
-                                    help="支持 CSV、Excel；CSV 自动尝试 UTF-8 和 GB18030 编码。")
-    st.caption("支持 .csv / .xlsx · Excel 可选择工作表")
+    uploaded_file = st.file_uploader("上传数据文件", type=["csv", "xlsx", "png", "jpg", "jpeg", "webp"],
+                                    help="支持 CSV、Excel 和表格图片；图片识别后需校对确认。")
+    st.caption("支持 CSV / Excel / PNG / JPG / WebP · 图片表格可识别")
     if uploaded_file is not None:
         st.success("文件已载入")
         st.text(uploaded_file.name)
     with st.expander("使用指南", expanded=uploaded_file is None):
-        st.markdown("1. 上传 CSV 或 Excel 文件\n2. 查看数据概览与字段质量\n3. 选择指标，生成图表\n4. 下载当前数据")
+        st.markdown("1. 上传数据文件或表格图片\n2. 查看数据概览与字段质量\n3. 选择指标，生成图表\n4. 下载当前数据")
     st.divider()
     st.caption("数据安全提示：请勿上传含密码或敏感个人信息的数据。")
 
@@ -57,15 +62,68 @@ if uploaded_file is None:
         for column, label in zip(st.columns(4), ["数据行数", "字段数量", "缺失值数量", "重复行数量"]):
             column.metric(label, "—")
         st.markdown('<div class="empty-state"><div>📂</div><h3>开启你的数据分析</h3>'
-                    '<p>在左侧上传 CSV 或 Excel 文件，即可查看概况、统计与图表。</p></div>',
+                    '<p>在左侧上传数据文件或表格图片，即可查看概况、统计与图表。</p></div>',
                     unsafe_allow_html=True)
     for tab in (preview, statistics, charts):
         with tab:
             st.info("请先在左侧上传数据文件。")
     st.stop()
 
+is_image = uploaded_file.name.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
+image_df = None
+if is_image:
+    # A separate review screen prevents unconfirmed OCR output entering analysis.
+    with overview:
+        st.subheader("图片表格识别与校对")
+        st.caption("适合清晰、正向、列对齐的表格截图。复杂排版、合并单元格及手写内容可能识别不准。图片仅在应用服务器本地处理，不发送第三方识别服务。")
+        payload = uploaded_file.getvalue()
+        if len(payload) > 15 * 1024 * 1024:
+            st.error("图片超过 15 MB，请先压缩或裁剪表格区域。")
+            st.stop()
+        try:
+            picture = Image.open(io.BytesIO(payload))
+            if picture.width * picture.height > 25_000_000:
+                raise ValueError("图片超过 2500 万像素，请先裁剪。")
+            picture.verify()
+            st.image(payload, caption="原始表格图片", width="stretch")
+        except Exception as error:
+            st.error(f"图片无法读取：{error}")
+            st.stop()
+        language = st.selectbox("识别语言", ["中文和英文", "英文"], key="ocr_language")
+        lang_code = "chi_sim" if language == "中文和英文" else "eng"
+        token = hashlib.sha256(payload + lang_code.encode()).hexdigest()
+        if st.button("识别表格", type="primary"):
+            try:
+                with st.spinner("正在识别，请稍候…"):
+                    csv_text, low_confidence = extract_table(payload, lang_code)
+                st.session_state["ocr_result"] = {"token": token, "csv": csv_text, "low": low_confidence}
+            except Exception as error:
+                st.session_state.pop("ocr_result", None)
+                st.error(f"识别失败：{error}")
+        result = st.session_state.get("ocr_result")
+        if result and result["token"] == token:
+            st.warning(f"识别可能存在错字、漏列或数字错误，低置信度文字共 {result['low']} 处。请对照原图校对列名、行列及数值；首行作为表头。")
+            corrected = st.text_area("校对识别结果（CSV 格式，可直接编辑）", value=result["csv"],
+                                     height=220, key=f"ocr_edit_{token}")
+            try:
+                image_df = pd.read_csv(io.StringIO(corrected))
+                if image_df.empty or len(image_df.columns) < 2:
+                    raise ValueError("需要至少一行数据和两列字段。")
+                st.dataframe(image_df, width="stretch", hide_index=True)
+            except Exception as error:
+                st.error(f"数据格式有误，请修正 CSV：{error}")
+                st.stop()
+            confirmed = st.checkbox("我已核对当前识别结果，继续分析", key="ocr_confirm_" + hashlib.sha256((token + corrected).encode()).hexdigest())
+            if not confirmed:
+                st.stop()
+        else:
+            st.info("点击「识别表格」，校对并确认结果后即可继续分析。")
+            st.stop()
+
 try:
-    if uploaded_file.name.lower().endswith(".csv"):
+    if is_image:
+        df = image_df
+    elif uploaded_file.name.lower().endswith(".csv"):
         try:
             df = pd.read_csv(uploaded_file)
         except UnicodeDecodeError:
